@@ -1,0 +1,190 @@
+---
+title: "Practical Machine Learning course project"
+author: "Oskari Pirttikoski"
+date: "6 February 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Goal
+
+Well analyse the Human Activity Recognition dataset originating from here: http://groupware.les.inf.puc-rio.br/har
+
+The goal of your project is to predict the manner in which they did the exercise i.e. the variable *classe*. Analysis is based on fitnes device sensory data. We will also predict values for given smaller test set.
+
+## Importing the data 
+
+```{r imports, results="hide", message=FALSE}
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(gbm)
+
+set.seed(3523) # for repeatable results
+```
+
+Enable parallel processing to speed up model fitting.
+
+```{r parallel, results="hide", message=FALSE}
+library(doMC)
+registerDoMC(cores = 5)
+```
+
+Read data in and split the bulk of the data to training and test sets. The provided test set contains only 20 observations so it cannot be used to validate accuracy.
+
+```{r read_data_in}
+all <- read.csv("pml-training.csv", na.strings = c("", "#DIV/0!", "NA"), header = TRUE)
+inTrain = createDataPartition(all$classe, p = 3/4, list = FALSE)
+trainingOrig = all[ inTrain,]
+testingOrig = all[-inTrain,]
+finalTestingOrig <- read.csv("pml-testing.csv", na.strings = c("", "#DIV/0!", "NA"), header = TRUE)
+```
+
+## Exploring the data
+
+Out of 159 possible predictors almost half are near zero variability so they are not suitable for predicting. We will remove them.
+
+```{r variability}
+nzv <- nearZeroVar(trainingOrig)
+training <- trainingOrig[, -nzv]
+testing <- testingOrig[, -nzv]
+finalTesting <- finalTestingOrig[, -nzv]
+```
+
+After looking at remaining columns we notice that some of them contain mostly NA's. None of the contain only few NA's so I'll remove all containing any. 
+
+Actually for forecasting it may be necessary to have no NA's. Here we remove the columns. Imputing values could be possible if the amount missing values would be smaller. 
+
+
+```{r remove_nas}
+noNas <- colSums(is.na(training)) == 0
+training <- training[, noNas]
+testing <- testing[, noNas]
+finalTesting <- finalTesting[, noNas]
+```
+
+The class seems to be similarly distributed over the few time points so we will perform no further timeseries analysis.
+
+```{r time, message=FALSE, out.width = '100%'}
+qplot(training$raw_timestamp_part_1) + facet_grid(training$classe ~ ., scales = 'free_y')
+```
+
+From following boxplots we see interesting correlation between variable X and the desired classe.
+
+
+```{r boxplots, message=FALSE, echo=FALSE, out.width = '100%'}
+library(reshape2)
+ggplot(data = melt(training), mapping = aes(y = value, x = classe, color= classe)) +  geom_boxplot() + facet_wrap(~variable, scales = 'free_y') +
+  theme(axis.title.y=element_blank(), axis.text.y=element_blank(),  axis.ticks.y=element_blank())
+```
+
+
+X variable seems to be index and we will leave it out. We will also leave out user name and timestamp related fields as they won't generally predict class.
+
+
+```{r remove_index, echo=FALSE}
+training <- training[, -(1:5)]
+testing <- testing[, -(1:5)]
+finalTesting <- finalTesting[, -(1:5)]
+```
+
+## Fitting models
+
+Next we will fit several models and print accuracy on test set for each.  Finally we will combine them into one ensemble model.
+
+### Primary components
+
+```{r PCA, echo=FALSE}
+  pcaPreproces <- preProcess(training[,c(-1, -55)], method= "pca", pcaComp = 10)
+  pcaValues <- predict(pcaPreproces, training[, c(-1, -55)])
+  pcaValues <- pcaValues %>% mutate(classe = training$classe)
+  pcaFit <- train(classe ~ ., data = pcaValues, method = "rf")
+  pcaTestValues <- predict(pcaPreproces, testing)
+  pcaFinalTestValues <- predict(pcaPreproces, finalTesting)
+  
+  pcaPred <- predict(pcaFit, pcaValues)
+  pcaTestPred <- predict(pcaFit, pcaTestValues)
+  pcaFinalPred <- predict(pcaFit, pcaFinalTestValues)
+  pcaCm <- confusionMatrix(testing$classe, pcaTestPred)
+  pcaCm$overall["Accuracy"]
+```
+
+### Random forest 
+
+Random forest seems to give the best accuracy.
+
+```{r random_forest}
+  rfFit <- train(classe ~ ., data = training, method = "rf")
+  
+  rfPred <- predict(rfFit, training)
+  rfTestPred <- predict(rfFit, testing)
+  rfFinalPred <- predict(rfFit, finalTesting)
+  
+  rfCm <- confusionMatrix(testing$classe, rfTestPred)
+  rfCm$overall["Accuracy"]
+```
+
+### Gradient boosting
+
+```{r GBM, echo=FALSE}
+  gbmFit <- train(classe ~ ., data=training, method="gbm", verbose=FALSE)
+  
+  gbmPred <- predict(gbmFit, training)
+  gbmTestPred <- predict(gbmFit, testing)
+  gbmFinalPred <- predict(gbmFit, finalTesting)
+  
+  gbmCm <- confusionMatrix(testing$classe, gbmTestPred)
+  gbmCm$overall["Accuracy"]
+```
+
+### Linear discriminant analysis
+
+```{r LDA, echo=FALSE}
+  ldaFit <- train(classe ~ ., data=training, method="lda", verbose=FALSE)
+
+  ldaPred <- predict(ldaFit, training)
+  ldaTestPred <- predict(ldaFit, testing)
+  ldaFinalPred <- predict(ldaFit, finalTesting)
+
+  ldaCm <- confusionMatrix(testing$classe, ldaTestPred)
+  ldaCm$overall["Accuracy"]
+```
+
+### Ensemble model
+
+Here we combine all four previous models.
+
+```{r ensemble_prediction}
+ensemble <- data.frame(rf=rfPred, gbm=gbmPred, pca=pcaPred, lda=ldaPred, classe = training$classe)
+testEnsemble <- data.frame(rf=rfTestPred, gbm=gbmTestPred, pca=pcaTestPred, lda=ldaTestPred)
+finalEnsemble <- data.frame(rf=rfFinalPred, gbm=gbmFinalPred, pca=pcaFinalPred, lda=ldaFinalPred)
+
+ensembleFit <- train(classe ~ ., data=ensemble, method="rf")
+
+testEnsemblePred <- predict(ensembleFit, testEnsemble)
+
+ensembleCm <- confusionMatrix(testing$classe, testEnsemblePred)
+
+show(ensembleCm$overall["Accuracy"])
+```
+
+## Conclusions
+
+In general there were few very high prediction accuracies.
+
+The accuracy for random forest is a bit better that on the ensemble model. Possibly due to over fitting to training data. The confusion matrix looks very promising:
+
+```{r predictions_results, echo=FALSE}
+show(rfCm$table)
+```
+
+Only 3 out of 4094 predictions were wrong. Amazing.
+
+So for quiz (final test) data and other further predictions we propose using the random forest model.
+
+```{r quizz_predictions, echo=FALSE}
+show(rfFinalPred)
+```
